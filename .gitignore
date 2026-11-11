@@ -1,0 +1,7 @@
+images/
+state/
+logs/
+backup/
+__pycache__/
+*.bak*
+*.pyc
