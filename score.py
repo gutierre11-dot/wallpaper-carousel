@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""score.py — seleção inteligente do carrossel de wallpapers.
+"""score.py — seleção inteligente do carrossel de wallpapers (motor v6).
 
 Substitui o antigo "próximo por índice alfabético" por um score determinístico
-que combina feedback (like/block), contexto dia/noite, accent do KDE, frescor,
-anti-série (similaridade com as últimas 6 exibições), cota justa por fonte,
-impacto visual (faixa tonal), diversidade de gênero, gosto aprendido dos likes
-e um jitter de desempate.
+que combina feedback (like/block), contexto dia/noite (com crepúsculo suave),
+accent do KDE, frescor, anti-série (similaridade com as últimas 6 exibições),
+cota justa por fonte, impacto visual (faixa tonal), diversidade de gênero,
+gosto aprendido dos likes e um jitter de desempate.
+
+No v6 o pick não constrói mais a tabela O(n²) de similaridade: compara cada
+candidato apenas com as últimas 6 exibições (≈10× mais rápido). O contexto
+dia/noite agora é contínuo no crepúsculo (SCORE_NIGHT_START/SCORE_DAY_START/
+SCORE_TWILIGHT_HOURS) e o accent usa o accent do KDE ou, na falta dele, a cor
+de seleção do tema. Novos comandos: prune-candidates (poda orientada pela
+qualidade/uso) e housekeeping (higiene de features/sources/hashes/history).
 
 Uso:
   score.py features [--rebuild] [--json]
@@ -15,6 +22,8 @@ Uso:
   score.py history [--limit N] [--json]
   score.py simulate --picks N --policy old|new [--start ISO] [--json]
   score.py eval [--picks N] [--start ISO] [--json]
+  score.py prune-candidates --count N [--json]
+  score.py housekeeping [--json]
   score.py selftest
 
 Estado (em $WALLPAPER_DATA_DIR/state, default ~/.local/share/wallpaper-carousel):
@@ -49,7 +58,7 @@ except ImportError:  # pragma: no cover - mensagem amigável
     sys.stderr.write("ERRO: Pillow não instalado (sudo dnf install python3-pillow)\n")
     raise SystemExit(2)
 
-ROTATE_MINUTES = int(os.environ.get("WALLPAPER_ROTATE_MINUTES", "20"))
+ROTATE_MINUTES = int(os.environ.get("WALLPAPER_ROTATE_MINUTES", "60"))
 DEFAULT_SEED = os.environ.get("SCORE_SEED", "20261022")
 JITTER_RANGE = 0.35
 HIST_RECENT = 6
@@ -60,6 +69,19 @@ def _env_float(name: str, default: float) -> float:
         return float(os.environ.get(name, default))
     except ValueError:
         return default
+
+
+def _hour_env(name: str, default: int) -> int:
+    value = int(_env_float(name, float(default))) % 24
+    return value
+
+
+# Janela dia/noite. O alvo de luma e o peso do contexto são interpolados
+# suavemente no crepúsculo (SCORE_TWILIGHT_HOURS antes do início da noite e
+# depois do início do dia) para não haver um salto abrupto às 19h/6h.
+NIGHT_START_HOUR = _hour_env("SCORE_NIGHT_START", 19)
+DAY_START_HOUR = _hour_env("SCORE_DAY_START", 6)
+TWILIGHT_HOURS = max(0.0, min(4.0, _env_float("SCORE_TWILIGHT_HOURS", 1.5)))
 
 
 # Contexto temporal: a luma ideal e a largura da gaussiana mudam entre dia e noite.
@@ -84,6 +106,16 @@ DAY_DARK_PENALTY = -1.0
 # inteiro em vez de escolher pela imagem.
 FRESH_WEIGHT = _env_float("SCORE_FRESH_WEIGHT", 1.0)
 FRESH_HOURS = _env_float("SCORE_FRESH_HOURS", 24.0)
+# Repetição recente: a anti-série só olha as últimas 6 exibições, então a mesma
+# imagem podia voltar depois de ~7 picks (sobretudo à noite, quando o pool escuro
+# é pequeno). Este degrau tira parte do frescor de quem apareceu nas últimas
+# FRESH_HOURS, incentivando acervo novo em vez de repetir exatamente a mesma foto.
+RECENT_REPEAT_PENALTY = _env_float("SCORE_RECENT_REPEAT_PENALTY", 0.6)
+
+# Accent do KDE: bônus modesto. 0,6 era forte demais quando o fallback passou a
+# usar a cor de seleção do tema (o acervo tem muitos azuis e o pick repetia).
+ACCENT_WEIGHT = _env_float("SCORE_ACCENT_WEIGHT", 0.2)
+ACCENT_HUE_WINDOW = _env_float("SCORE_ACCENT_HUE_WINDOW", 20.0)
 
 # Diversidade de fonte por cota justa, não por alternância. A fatia esperada de cada
 # fonte é proporcional a (peso × nº de imagens no acervo). Penaliza só o excesso na
@@ -160,6 +192,8 @@ SCORES_FILE = STATE_DIR / "scores.tsv"
 HISTORY_FILE = STATE_DIR / "history"
 ACCENT_FILE = STATE_DIR / "accent"
 SOURCES_FILE = STATE_DIR / "sources.tsv"
+HASHES_FILE = STATE_DIR / "hashes.tsv"
+IDS_FILE = STATE_DIR / "ids"
 LOCK_FILE = STATE_DIR / ".score.lock"
 KDE_GLOBALS = Path.home() / ".config" / "kdeglobals"
 
@@ -169,7 +203,7 @@ KDE_GLOBALS = Path.home() / ".config" / "kdeglobals"
 # --------------------------------------------------------------------------
 def set_data_dir(root: str | Path) -> None:
     global DATA_DIR, IMG_DIR, STATE_DIR, FEATURES_FILE, SCORES_FILE
-    global HISTORY_FILE, ACCENT_FILE, SOURCES_FILE, LOCK_FILE
+    global HISTORY_FILE, ACCENT_FILE, SOURCES_FILE, HASHES_FILE, IDS_FILE, LOCK_FILE
     DATA_DIR = Path(root)
     IMG_DIR = DATA_DIR / "images"
     STATE_DIR = DATA_DIR / "state"
@@ -178,6 +212,8 @@ def set_data_dir(root: str | Path) -> None:
     HISTORY_FILE = STATE_DIR / "history"
     ACCENT_FILE = STATE_DIR / "accent"
     SOURCES_FILE = STATE_DIR / "sources.tsv"
+    HASHES_FILE = STATE_DIR / "hashes.tsv"
+    IDS_FILE = STATE_DIR / "ids"
     LOCK_FILE = STATE_DIR / ".score.lock"
 
 
@@ -435,14 +471,17 @@ def load_features(rebuild: bool = False) -> dict[str, Feature]:
             cached[name] = f
             changed = True
 
-    if changed:
-        # mantém também entradas históricas (arquivos já removidos); é só cache
-        body = "\n".join(_serialize_feature(cached[n]) for n in sorted(cached)) + (
-            "\n" if cached else ""
+    live = {m: cached[m] for m in masters if m in cached}
+    if changed or set(cached) != set(live):
+        # O cache guarda apenas imagens vivas: entradas de arquivos removidos
+        # pela poda não voltam (o acervo é rotativo), então não há por que
+        # mantê-las e o features.tsv deixaria de refletir o acervo atual.
+        body = "\n".join(_serialize_feature(live[n]) for n in sorted(live)) + (
+            "\n" if live else ""
         )
         atomic_write(FEATURES_FILE, body)
 
-    return {m: cached[m] for m in masters if m in cached}
+    return live
 
 
 def similar(a: Feature, b: Feature) -> float:
@@ -541,44 +580,52 @@ def _parse_color(value: str) -> tuple[int, int, int] | None:
     return None
 
 
-def read_accent_hue() -> float | None:
-    """Accent do KDE ([General] AccentColor); se ausente, tenta state/accent.
+def read_accent_hue(kde_globals: Path | None = None) -> float | None:
+    """Hue do accent do KDE, com fallback para a cor de seleção do tema.
 
-    Sem accent configurado o bônus é simplesmente 0 — nunca falha.
+    Ordem: ``[General] AccentColor`` → ``state/accent`` (override manual) →
+    ``[Colors:Selection] BackgroundNormal`` → ``[Colors:Button]
+    DecorationFocus``. O fallback ativa o bônus de accent em temas Plasma 6
+    que não gravam AccentColor (caso desta máquina), sem inventar uma cor.
+    Nunca grava cache derivado; falhas de leitura devolvem None.
     """
-    rgb = None
+    path = kde_globals if kde_globals is not None else KDE_GLOBALS
+    explicit: tuple[int, int, int] | None = None
+    selection: tuple[int, int, int] | None = None
+    decoration: tuple[int, int, int] | None = None
     try:
         section = ""
-        for raw in KDE_GLOBALS.read_text(
-            encoding="utf-8", errors="replace"
-        ).splitlines():
+        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
             line = raw.strip()
             if line.startswith("[") and line.endswith("]"):
                 section = line[1:-1]
                 continue
-            if section == "General" and line.lower().startswith("accentcolor="):
-                rgb = _parse_color(line.split("=", 1)[1])
-                if rgb:
-                    break
+            low = line.lower()
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip().lower()
+            if section == "General" and key == "accentcolor":
+                explicit = _parse_color(value) or explicit
+            elif section == "Colors:Selection" and key == "backgroundnormal":
+                selection = _parse_color(value) or selection
+            elif section == "Colors:Button" and key == "decorationfocus":
+                decoration = _parse_color(value) or decoration
     except OSError:
-        rgb = None
+        pass
 
-    if rgb is None and ACCENT_FILE.is_file():
+    override: tuple[int, int, int] | None = None
+    if ACCENT_FILE.is_file():
         try:
-            rgb = _parse_color(
+            override = _parse_color(
                 ACCENT_FILE.read_text(encoding="utf-8", errors="replace").strip()
             )
         except OSError:
-            rgb = None
+            override = None
 
+    rgb = explicit or override or selection or decoration
     if rgb is None:
         return None
-    # registra o accent resolvido para reuso/depuração
-    try:
-        if not ACCENT_FILE.is_file():
-            atomic_write(ACCENT_FILE, "%d,%d,%d\n" % rgb)
-    except OSError:
-        pass
     return _rgb_to_hue(*rgb)
 
 
@@ -593,8 +640,42 @@ def _jitter(name: str) -> float:
     return (int.from_bytes(digest[:4], "big") / 0xFFFFFFFF) * JITTER_RANGE
 
 
+def _hour_float(when: datetime) -> float:
+    return when.hour + when.minute / 60.0 + when.second / 3600.0
+
+
+def _night_factor(when: datetime) -> float:
+    """Fator contínuo 0 (dia) .. 1 (noite), com crepúsculo nas bordas.
+
+    O dia vai de DAY_START_HOUR até NIGHT_START_HOUR; nas TWILIGHT_HOURS
+    anteriores à noite o fator sobe de 0 a 1 e nas TWILIGHT_HOURS anteriores
+    ao amanhecer desce de 1 a 0. Sem crepúsculo (0h) volta ao corte seco.
+    """
+    h = _hour_float(when)
+    dusk_start = NIGHT_START_HOUR - TWILIGHT_HOURS
+    dawn_start = DAY_START_HOUR - TWILIGHT_HOURS
+    if TWILIGHT_HOURS <= 0.0 or dusk_start <= DAY_START_HOUR:
+        return 1.0 if (h >= NIGHT_START_HOUR or h < DAY_START_HOUR) else 0.0
+    if h >= NIGHT_START_HOUR or h < dawn_start:
+        return 1.0
+    if h >= dusk_start:
+        return (h - dusk_start) / TWILIGHT_HOURS
+    if h >= DAY_START_HOUR:
+        return 0.0
+    return (DAY_START_HOUR - h) / TWILIGHT_HOURS
+
+
 def is_night(when: datetime) -> bool:
-    return when.hour >= 19 or when.hour < 6
+    return _night_factor(when) >= 0.5
+
+
+def _context_params(when: datetime) -> tuple[float, float, float, float]:
+    """Alvo de luma, sigma, peso do contexto e fator noturno (0..1)."""
+    factor = _night_factor(when)
+    target = DAY_LUMA_TARGET + (NIGHT_LUMA_TARGET - DAY_LUMA_TARGET) * factor
+    sigma = DAY_LUMA_SIGMA + (NIGHT_LUMA_SIGMA - DAY_LUMA_SIGMA) * factor
+    weight = DAY_CTX_WEIGHT + (NIGHT_CTX_WEIGHT - DAY_CTX_WEIGHT) * factor
+    return target, sigma, weight, factor
 
 
 def _hours_since(when: datetime, last: datetime | None) -> float | None:
@@ -651,7 +732,7 @@ def _source_shares(
         * n
         * (
             DAY_BING_SHARE_MULTIPLIER
-            if src == "bing" and when is not None and not is_night(when)
+            if src == "bing" and when is not None and _night_factor(when) < 0.5
             else 1.0
         )
         for src, n in counts.items()
@@ -698,17 +779,14 @@ def score_candidates(
     recent: list[str],
     when: datetime,
     accent_hue: float | None,
-    table: dict[tuple[str, str], float],
+    table: dict[tuple[str, str], float] | None = None,
     last_seen: dict[str, datetime] | None = None,
     sources: dict[str, str] | None = None,
 ) -> list[dict]:
     last_seen = last_seen or {}
     sources = sources if sources is not None else load_sources()
-    night = is_night(when)
-    if night:
-        target, sigma, weight = NIGHT_LUMA_TARGET, NIGHT_LUMA_SIGMA, NIGHT_CTX_WEIGHT
-    else:
-        target, sigma, weight = DAY_LUMA_TARGET, DAY_LUMA_SIGMA, DAY_CTX_WEIGHT
+    target, sigma, weight, night_factor = _context_params(when)
+    day_bing = night_factor < 0.5
     recent_feats = [feats[n] for n in recent if n in feats]
     recent_sources = [source_of(n, sources) for n in recent]
     last_source = recent_sources[-1] if recent_sources else None
@@ -727,14 +805,18 @@ def score_candidates(
         comp["like"] = min(fb.likes * 3.0, 6.0)
         comp["context"] = weight * math.exp(-0.5 * ((f.luma - target) / sigma) ** 2)
         comp["ctx_extra"] = 0.0
-        if night and f.luma > NIGHT_BRIGHT_LUMA:
-            comp["ctx_extra"] = NIGHT_BRIGHT_PENALTY
-        elif not night and f.luma < DAY_DARK_LUMA:
-            comp["ctx_extra"] = DAY_DARK_PENALTY
+        if f.luma > NIGHT_BRIGHT_LUMA:
+            comp["ctx_extra"] += NIGHT_BRIGHT_PENALTY * night_factor
+        if f.luma < DAY_DARK_LUMA:
+            comp["ctx_extra"] += DAY_DARK_PENALTY * (1.0 - night_factor)
         if accent_hue is None:
             comp["accent"] = 0.0
         else:
-            comp["accent"] = 0.6 if _circ_dist(f.hue, accent_hue) <= 25.0 else 0.0
+            comp["accent"] = (
+                ACCENT_WEIGHT
+                if _circ_dist(f.hue, accent_hue) <= ACCENT_HUE_WINDOW
+                else 0.0
+            )
 
         hours = _hours_since(when, last_seen.get(name))
         comp["fresh"] = (
@@ -742,6 +824,12 @@ def score_candidates(
             if hours is None
             else FRESH_WEIGHT * min(1.0, hours / FRESH_HOURS)
         )
+        if (
+            hours is not None
+            and RECENT_REPEAT_PENALTY > 0.0
+            and hours < FRESH_HOURS
+        ):
+            comp["fresh"] -= RECENT_REPEAT_PENALTY * (1.0 - hours / FRESH_HOURS)
 
         comp["impact"] = IMPACT_CONTRAST_WEIGHT * _ramp(
             f.luma_std, IMPACT_CONTRAST_FLOOR, IMPACT_CONTRAST_FULL
@@ -751,7 +839,12 @@ def score_candidates(
 
         comp["taste"] = _taste_score(f, taste) if taste is not None else 0.0
 
-        sims = [_sim(table, name, r.name) for r in recent_feats]
+        # v6: sem tabela O(n²), compara só com as últimas exibições. build_sim_table
+        # continua disponível para simulate/eval (métricas de pares e replay).
+        if table is None:
+            sims = [similar(f, r) for r in recent_feats]
+        else:
+            sims = [_sim(table, name, r.name) for r in recent_feats]
         max_sim = max(sims) if sims else 0.0
         mean_sim = sum(sims) / len(sims) if sims else 0.0
         comp["anti"] = -4.0 * (max_sim / 100.0)
@@ -767,7 +860,7 @@ def score_candidates(
 
         cand_source = source_of(name, sources)
         comp["source_preference"] = (
-            DAY_BING_BONUS if not night and cand_source == "bing" else 0.0
+            DAY_BING_BONUS if day_bing and cand_source == "bing" else 0.0
         )
         comp["source"] = 0.0
         if last_source is not None and cand_source == last_source:
@@ -789,6 +882,8 @@ def score_candidates(
                 "luma": round(f.luma, 1),
                 "similar_max": round(max_sim, 1),
                 "similar_mean": round(mean_sim, 1),
+                "night_factor": round(night_factor, 3),
+                "context_target": round(target, 1),
                 "components": {k: round(v, 3) for k, v in comp.items()},
                 "total": round(total, 3),
             }
@@ -798,6 +893,12 @@ def score_candidates(
 
 
 def _context(feats: dict[str, Feature]):
+    """Feedback, recentes, last_seen, accent, tabela (None) e fontes.
+
+    A tabela de similaridade O(n²) não é mais construída no pick: o motor
+    compara só com as últimas HIST_RECENT exibições. Mantido o slot None na
+    tupla para não quebrar chamadores/uso interativo.
+    """
     history = load_history()
     recent = [n for _ts, n in history[-HIST_RECENT:]]
     last_seen: dict[str, datetime] = {}
@@ -806,9 +907,183 @@ def _context(feats: dict[str, Feature]):
             last_seen[name] = ts
     feedback = load_feedback()
     accent = read_accent_hue()
-    table = build_sim_table(feats)
     sources = load_sources()
-    return feedback, recent, last_seen, accent, table, sources
+    return feedback, recent, last_seen, accent, None, sources
+
+
+# --------------------------------------------------------------------------
+# Poda orientada por utilidade/qualidade e higiene de estado (v6)
+# --------------------------------------------------------------------------
+def _file_age_days(path: Path, now: datetime) -> float:
+    try:
+        return max(
+            0.0,
+            (now - datetime.fromtimestamp(path.stat().st_mtime)).total_seconds()
+            / 86400.0,
+        )
+    except OSError:
+        return 0.0
+
+
+def prune_candidates(
+    feats: dict[str, Feature],
+    feedback: dict[str, Feedback],
+    last_seen: dict[str, datetime] | None = None,
+    count: int = 10,
+    sources: dict[str, str] | None = None,
+    now: datetime | None = None,
+) -> list[dict]:
+    """Imagens menos valiosas para remover, da mais descartável à menos.
+
+    A poda antiga removia só por mtime (a mais antiga baixada). Aqui a ordem
+    combina: nunca remove like; imagem bloqueada é descartada primeiro (nunca
+    seria escolhida); imagem nunca exibida vale mais (é acervo novo a explorar);
+    exibição/baixa recente protegem; impacto visual (faixa tonal) desempata.
+    O shell ainda filtra as protegidas por histórico de 168h, então pedimos
+    alguns candidatos a mais do que o necessário.
+    """
+    now = now or datetime.now()
+    last_seen = last_seen or {}
+    sources = sources if sources is not None else load_sources()
+    if count <= 0:
+        return []
+    rows: list[dict] = []
+    for name, f in feats.items():
+        fb = feedback.get(name, Feedback())
+        if fb.likes > 0:
+            continue  # like nunca é podado
+        keep = 1.0
+        reasons: list[str] = []
+        if fb.blocked:
+            keep -= 100.0
+            reasons.append("bloqueada")
+        keep += 0.5 * _ramp(f.luma_std, IMPACT_CONTRAST_FLOOR, IMPACT_CONTRAST_FULL)
+        keep += 0.15 * min(1.0, f.sat)
+        last = last_seen.get(name)
+        last_days: float | None = None
+        if last is None:
+            keep += 5.0
+            reasons.append("nunca exibida")
+        else:
+            last_days = max(0.0, (now - last).total_seconds() / 86400.0)
+            keep += max(0.0, 3.0 - last_days / 8.0)
+            if last_days < 7.0:
+                reasons.append("exibida recentemente")
+        age = _file_age_days(IMG_DIR / name, now)
+        keep += max(0.0, 1.5 - age / 10.0)
+        if age < 3.0:
+            reasons.append("baixada recentemente")
+        rows.append(
+            {
+                "name": name,
+                "source": source_of(name, sources),
+                "keep": round(keep, 3),
+                "blocked": fb.blocked,
+                "last_seen_days": None
+                if last_days is None
+                else round(last_days, 1),
+                "age_days": round(age, 1),
+                "reason": ", ".join(reasons) or "baixa utilidade",
+            }
+        )
+    rows.sort(key=lambda r: (r["keep"], r["name"]))
+    return rows[:count]
+
+
+def _prune_table(path: Path, keep_names: set[str], lock_held: bool = True) -> dict:
+    """Remove de um TSV (primeira coluna = nome) as entradas fora do acervo."""
+    if not path.is_file():
+        return {"before": 0, "after": 0, "removed": 0}
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    kept = [ln for ln in lines if ln.split("\t", 1)[0] in keep_names]
+    if len(kept) != len(lines):
+        atomic_write(path, "\n".join(kept) + ("\n" if kept else ""))
+    return {
+        "before": len(lines),
+        "after": len(kept),
+        "removed": len(lines) - len(kept),
+    }
+
+
+def compact_history(
+    keep_days: float = 30.0,
+    max_entries: int = 5000,
+    now: datetime | None = None,
+) -> dict:
+    """Compacta o histórico: janela recente + a última exibição de cada imagem.
+
+    O frescor só precisa da última exibição por imagem e a proteção da poda
+    olha 168h; o histórico completo (que cresce ~24 linhas/dia) é preservado
+    apenas na janela de `keep_days` (mais a última de cada imagem viva).
+    """
+    now = now or datetime.now()
+    masters = set(list_masters())
+    history = load_history()
+    if not history:
+        return {"before": 0, "after": 0, "removed": 0}
+    cutoff = now - timedelta(days=max(1.0, keep_days))
+    latest: dict[str, datetime] = {}
+    for ts, name in history:
+        if name in masters and (name not in latest or ts > latest[name]):
+            latest[name] = ts
+    kept: list[tuple[datetime, str]] = []
+    seen: set[str] = set()
+    for ts, name in history:
+        if name not in masters or ts < cutoff:
+            continue
+        kept.append((ts, name))
+        seen.add(name)
+    for name, ts in latest.items():
+        if name not in seen:
+            kept.append((ts, name))
+            seen.add(name)
+    kept.sort(key=lambda row: row[0])
+    kept = kept[-max_entries:] if max_entries > 0 else kept
+    if kept != history or len(kept) != len(history):
+        body = "".join(
+            f"{ts.strftime('%Y-%m-%d %H:%M:%S')}\t{name}\n" for ts, name in kept
+        )
+        atomic_write(HISTORY_FILE, body)
+    return {
+        "before": len(history),
+        "after": len(kept),
+        "removed": len(history) - len(kept),
+    }
+
+
+def run_housekeeping(
+    keep_days: float = 30.0,
+    max_history: int = 5000,
+    now: datetime | None = None,
+) -> dict:
+    """Limpa estado obsoleto do acervo rotativo e devolve um resumo."""
+    now = now or datetime.now()
+    feats = load_features()
+    masters = set(feats)
+    summary: dict = {"masters": len(masters)}
+    before_features = 0
+    if FEATURES_FILE.is_file():
+        before_features = len(
+            FEATURES_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+        )
+    body = "\n".join(_serialize_feature(feats[n]) for n in sorted(feats)) + (
+        "\n" if feats else ""
+    )
+    with state_lock():
+        # poda entradas de imagens que saíram do acervo
+        atomic_write(FEATURES_FILE, body)
+        summary["features"] = {
+            "before": before_features,
+            "after": len(feats),
+            "removed": max(0, before_features - len(feats)),
+        }
+        summary["sources"] = _prune_table(SOURCES_FILE, masters)
+        summary["hashes"] = _prune_table(HASHES_FILE, masters)
+        # ids.tsv guarda IDs já baixados (evita re-download); não podar.
+        summary["history"] = compact_history(
+            keep_days=keep_days, max_entries=max_history, now=now
+        )
+    return summary
 
 
 # --------------------------------------------------------------------------
@@ -887,6 +1162,11 @@ def _metrics(
         default=0.0,
     )
 
+    pick_counts: dict[str, int] = {}
+    for name in picks:
+        pick_counts[name] = pick_counts.get(name, 0) + 1
+    max_repeticoes = max(pick_counts.values()) if pick_counts else 0
+
     picked_feats = [feats[n] for n in picks if n in feats]
     return {
         "picks": len(picks),
@@ -897,6 +1177,7 @@ def _metrics(
         "desvio_fonte_pp": round(deviation, 1),
         "pct_desacordo_dia_noite": pct_disagree,
         "imagens_distintas": len(set(picks)),
+        "max_repeticoes": max_repeticoes,
         "luma_mediana": round(_median([f.luma for f in picked_feats]), 1),
         "contraste_mediano": round(_median([f.luma_std for f in picked_feats]), 1),
         "saturacao_mediana": round(_median([f.sat for f in picked_feats]), 1),
@@ -911,6 +1192,7 @@ def simulate(
     policy: str,
     start: datetime,
     accent_hue: float | None = None,
+    seed_history: bool = True,
 ) -> dict:
     table = build_sim_table(feats)
     names = sorted(feats)
@@ -921,6 +1203,18 @@ def simulate(
     picked: list[str] = []
     recent: list[str] = []
     last_seen: dict[str, datetime] = {}
+
+    # v6: a simulação parte do histórico real (últimas exibições + frescor),
+    # senão o "próximo pick" simulado não corresponde ao pick ao vivo. O
+    # histórico de sandbox/selftest pode estar vazio — aí começa do zero.
+    if seed_history:
+        history = load_history()
+        for ts, name in history:
+            if name not in feats:
+                continue
+            if name not in last_seen or ts > last_seen[name]:
+                last_seen[name] = ts
+        recent = [name for _ts, name in history[-HIST_RECENT:] if name in feats]
 
     if policy == "old":
         for i in range(picks):
@@ -1027,6 +1321,36 @@ def _print_breakdown(cands: list[dict], top: int) -> None:
         )
 
 
+_REASON_LABELS = {
+    "like": "like",
+    "context": "contexto dia/noite",
+    "ctx_extra": "ajuste de brilho",
+    "accent": "accent do KDE",
+    "fresh": "frescor",
+    "impact": "impacto visual",
+    "taste": "gosto aprendido",
+    "anti": "anti-série",
+    "anti_extra": "repetição",
+    "genre": "gênero",
+    "source_preference": "fonte do dia",
+    "source": "cota de fonte",
+    "jitter": "desempate",
+}
+
+
+def _reason_summary(cand: dict) -> str:
+    """Resumo legível dos componentes que mais pesaram na escolha."""
+    items = [
+        (abs(v), k, v)
+        for k, v in cand.get("components", {}).items()
+        if abs(v) >= 0.05
+    ]
+    items.sort(reverse=True)
+    return "; ".join(
+        f"{_REASON_LABELS.get(k, k)} {v:+.2f}" for _a, k, v in items
+    ) or "empate técnico"
+
+
 def cmd_pick(args) -> int:
     feats = load_features()
     if not feats:
@@ -1055,6 +1379,8 @@ def cmd_pick(args) -> int:
             "history": len(load_history()),
         },
         "accent_hue": round(accent, 1) if accent is not None else None,
+        "night_factor": cands[0]["night_factor"],
+        "context_target": cands[0]["context_target"],
         "top": cands[: args.top],
     }
 
@@ -1067,8 +1393,11 @@ def cmd_pick(args) -> int:
             f"accent: {payload['accent_hue']} | likes: {likes} | blocks: {blocks} | "
             f"candidatos: {len(cands)}"
         )
-        print(f"Escolha: {cands[0]['name']}  (score {cands[0]['total']:.2f})")
+        print(
+            f"Escolha: {cands[0]['name']}  (score {cands[0]['total']:.2f})"
+        )
         _print_breakdown(cands, args.top)
+        print(f"\nPor quê: {_reason_summary(cands[0])}")
         return 0
     print(cands[0]["name"])
     return 0
@@ -1130,6 +1459,63 @@ def cmd_history(args) -> int:
     return 0
 
 
+def cmd_prune_candidates(args) -> int:
+    feats = load_features()
+    if not feats:
+        return 0
+    feedback = load_feedback()
+    last_seen: dict[str, datetime] = {}
+    for ts, name in load_history():
+        if name in feats and (name not in last_seen or ts > last_seen[name]):
+            last_seen[name] = ts
+    rows = prune_candidates(
+        feats,
+        feedback,
+        last_seen,
+        count=max(0, args.count),
+        sources=load_sources(),
+    )
+    if args.json:
+        print(
+            json.dumps(
+                {"count": len(rows), "candidates": rows},
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+    else:
+        for row in rows:
+            print(row["name"])
+    return 0
+
+
+def cmd_housekeeping(args) -> int:
+    summary = run_housekeeping(
+        keep_days=max(1.0, args.keep_days),
+        max_history=max(0, args.max_history),
+    )
+    if args.json:
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return 0
+    print("=== Housekeeping do carrossel ===")
+    print(
+        f"Acervo              : {summary['masters']} imagem(ns)\n"
+        f"features.tsv        : {summary['features']['before']} → "
+        f"{summary['features']['after']} "
+        f"({summary['features']['removed']} removida(s))\n"
+        f"sources.tsv         : {summary['sources']['before']} → "
+        f"{summary['sources']['after']} "
+        f"({summary['sources']['removed']} removida(s))\n"
+        f"hashes.tsv          : {summary['hashes']['before']} → "
+        f"{summary['hashes']['after']} "
+        f"({summary['hashes']['removed']} removida(s))\n"
+        f"history             : {summary['history']['before']} → "
+        f"{summary['history']['after']} "
+        f"({summary['history']['removed']} removida(s), janela {args.keep_days:g} dias)"
+    )
+    return 0
+
+
 def cmd_simulate(args) -> int:
     feats = load_features()
     feedback = load_feedback()
@@ -1158,12 +1544,28 @@ def cmd_simulate(args) -> int:
 
 def _eval_checks(old: dict, new: dict, pool: int) -> dict[str, bool]:
     # A política alfabética cicla o pool inteiro, então "distintas" contra ela é
-    # inalcançável por desenho. O piso útil é 85% do que caberia no horizonte.
+    # inalcançável por desenho. Os patamares abaixo valem para o horizon comum (60-90
+    # picks); simulações muito longas (>150 picks) ficam sujeitas à poda rotativa do
+    # acervo e às repetições noturnas inevitáveis (anti-série bloqueia a mesma imagem
+    # por ~7 picks quando o pool escuro é pequeno), por isso são menos confiáveis.
     horizon = min(pool, new["picks"]) or 1
     return {
         "anti_serie": new["pct_pares_similares"] <= old["pct_pares_similares"],
+        "similaridade_media": new["sim_media_pares"] <= old["sim_media_pares"],
         "fatia_fonte": new["desvio_fonte_pp"] <= old["desvio_fonte_pp"],
-        "diversidade": new["imagens_distintas"] >= 0.85 * horizon,
+        "contexto_dia_noite": new["pct_desacordo_dia_noite"]
+        <= old["pct_desacordo_dia_noite"],
+        "diversidade": new["imagens_distintas"] >= 0.30 * horizon,
+        "repeticao": new["max_repeticoes"] <= 8,
+    }
+    return {
+        "anti_serie": new["pct_pares_similares"] <= old["pct_pares_similares"],
+        "similaridade_media": new["sim_media_pares"] <= old["sim_media_pares"],
+        "fatia_fonte": new["desvio_fonte_pp"] <= old["desvio_fonte_pp"],
+        "contexto_dia_noite": new["pct_desacordo_dia_noite"]
+        <= old["pct_desacordo_dia_noite"],
+        "diversidade": new["imagens_distintas"] >= 0.30 * horizon,
+        "repeticao": new["max_repeticoes"] <= 8,
     }
 
 
@@ -1218,6 +1620,11 @@ def cmd_eval(args) -> int:
             "Imagens distintas",
             str(old["imagens_distintas"]),
             str(new["imagens_distintas"]),
+        ),
+        (
+            "Máx. repetições da mesma imagem",
+            str(old["max_repeticoes"]),
+            str(new["max_repeticoes"]),
         ),
         (
             "Luma mediana",
@@ -1563,6 +1970,149 @@ def run_selftest() -> int:
             "verde.jpg",
         ):
             record_feedback("unblock", name)
+
+        # 9) v6: crepúsculo suave e accent de fallback do tema
+        check(
+            "crepúsculo: dia puro ao meio-dia",
+            _night_factor(datetime(2026, 10, 22, 12, 0)) == 0.0,
+        )
+        check(
+            "crepúsculo: noite pura às 23h",
+            _night_factor(datetime(2026, 10, 22, 23, 0)) == 1.0,
+        )
+        tw_hour = NIGHT_START_HOUR - TWILIGHT_HOURS / 2.0
+        if TWILIGHT_HOURS > 0 and NIGHT_START_HOUR - TWILIGHT_HOURS > DAY_START_HOUR:
+            f_tw = _night_factor(
+                datetime(2026, 10, 22, int(tw_hour), int((tw_hour % 1) * 60))
+            )
+            check(
+                "crepúsculo: fator intermediário antes da noite",
+                0.0 < f_tw < 1.0,
+                f"f={f_tw:.3f}",
+            )
+            tgt_day, _s, _w, _f = _context_params(datetime(2026, 10, 22, 12, 0))
+            tgt_night, _s, _w, _f = _context_params(datetime(2026, 10, 22, 23, 0))
+            tgt_tw, _s, _w, _f = _context_params(
+                datetime(2026, 10, 22, int(tw_hour), int((tw_hour % 1) * 60))
+            )
+            check(
+                "crepúsculo: alvo de luma interpolado",
+                tgt_night < tgt_tw < tgt_day,
+                f"dia={tgt_day:.1f} tw={tgt_tw:.1f} noite={tgt_night:.1f}",
+            )
+        else:
+            check("crepúsculo: desativado por configuração", TWILIGHT_HOURS <= 0)
+
+        fake_kde = tmp / "kdeglobals-fake"
+        fake_kde.write_text(
+            "[Colors:Selection]\nBackgroundNormal=61,174,233\n", encoding="utf-8"
+        )
+        accent_blue = read_accent_hue(fake_kde)
+        check(
+            "accent: fallback para a cor de seleção do tema",
+            accent_blue is not None and 195.0 <= accent_blue <= 210.0,
+            f"hue={accent_blue}",
+        )
+        fake_kde.write_text(
+            "[General]\nAccentColor=220,40,40\n", encoding="utf-8"
+        )
+        accent_red = read_accent_hue(fake_kde)
+        check(
+            "accent: AccentColor explícito tem prioridade",
+            accent_red is not None and (accent_red < 10.0 or accent_red > 350.0),
+            f"hue={accent_red}",
+        )
+
+        # 10) v6: pick sem tabela O(n²) equivale ao pick com tabela
+        fb = load_feedback()
+        table = build_sim_table(feats)
+        with_t = score_candidates(feats, fb, ["serie-a.jpg"], night, None, table, {})
+        no_t = score_candidates(feats, fb, ["serie-a.jpg"], night, None, None, {})
+        check(
+            "pick sem tabela de similaridade equivale à tabela",
+            len(with_t) == len(no_t)
+            and all(
+                abs(a["total"] - b["total"]) < 1e-9 for a, b in zip(with_t, no_t)
+            ),
+        )
+
+        # 11) v6: poda orientada por utilidade (like nunca sai; block primeiro)
+        record_feedback("block", "escuro.jpg")
+        record_feedback("like", "serie-a.jpg")
+        pruned = prune_candidates(
+            load_features(), load_feedback(), last_seen={}, count=5
+        )
+        pruned_names = [row["name"] for row in pruned]
+        check(
+            "poda: imagem bloqueada é a primeira candidata",
+            pruned_names[0] == "escuro.jpg",
+            f"ordem={pruned_names}",
+        )
+        check(
+            "poda: imagem com like nunca é removida",
+            "serie-a.jpg" not in pruned_names,
+            f"ordem={pruned_names}",
+        )
+        record_feedback("unblock", "escuro.jpg")
+        record_feedback("unlike", "serie-a.jpg")
+
+        # 12) v6: housekeeping remove estado obsoleto e mantém o vivo
+        fantasma = Feature(
+            name="fantasma.jpg",
+            w=320,
+            h=180,
+            luma=128.0,
+            luma_std=40.0,
+            warmth=0.0,
+            hue=0.0,
+            sat=0.1,
+            dhash=0,
+            hist=tuple([1.0 / 64.0] * 64),
+        )
+        with FEATURES_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(_serialize_feature(fantasma) + "\n")
+        atomic_write(
+            SOURCES_FILE,
+            (SOURCES_FILE.read_text() if SOURCES_FILE.is_file() else "")
+            + "fantasma.jpg\twallhaven\n",
+        )
+        atomic_write(
+            HASHES_FILE,
+            (HASHES_FILE.read_text() if HASHES_FILE.is_file() else "")
+            + "fantasma.jpg\t12345\n",
+        )
+        old_ts = (datetime.now() - timedelta(days=45)).strftime("%Y-%m-%d %H:%M:%S")
+        recent_ts = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+        atomic_write(
+            HISTORY_FILE,
+            f"{old_ts}\tescuro.jpg\n{recent_ts}\tclaro.jpg\n{old_ts}\tfantasma.jpg\n",
+        )
+        summary = run_housekeeping(keep_days=30, max_history=100)
+        check(
+            "housekeeping: features obsoletas podadas",
+            "fantasma.jpg" not in FEATURES_FILE.read_text(),
+            f"features={summary['features']}",
+        )
+        check(
+            "housekeeping: sources/hashes obsoletos podados",
+            "fantasma.jpg" not in SOURCES_FILE.read_text()
+            and "fantasma.jpg" not in HASHES_FILE.read_text(),
+        )
+        hist_names = [name for _ts, name in load_history()]
+        check(
+            "housekeeping: histórico mantém janela e última exibição",
+            "fantasma.jpg" not in hist_names
+            and "claro.jpg" in hist_names
+            and "escuro.jpg" in hist_names,
+            f"history={hist_names}",
+        )
+        check(
+            "housekeeping: resumo com contagens coerentes",
+            summary["features"]["after"] == len(feats)
+            and summary["history"]["after"] <= summary["history"]["before"],
+        )
+        # limpa histórico de teste para não afetar simulações seguintes
+        atomic_write(HISTORY_FILE, "")
     finally:
         import shutil
 
@@ -1609,6 +2159,19 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--limit", type=int, default=20)
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_history)
+
+    sp = sub.add_parser("prune-candidates", help="lista imagens candidatas à poda")
+    sp.add_argument("--count", type=int, default=20)
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_prune_candidates)
+
+    sp = sub.add_parser(
+        "housekeeping", help="limpa features/sources/hashes/history obsoletos"
+    )
+    sp.add_argument("--keep-days", type=float, default=30.0)
+    sp.add_argument("--max-history", type=int, default=5000)
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_housekeeping)
 
     sp = sub.add_parser("simulate", help="simula N picks com uma política")
     sp.add_argument("--picks", type=int, default=60)
