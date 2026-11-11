@@ -279,6 +279,10 @@ class State:
 
 _SOURCE_PREFIXES = (
     ("wallhaven-", "wallhaven"),
+    ("wallpaperscom-", "wallpaperscom"),
+    ("wikimedia-", "wikimedia"),
+    ("openverse-", "openverse"),
+    ("nasa-", "nasa"),
     ("reddit-", "reddit"),
     ("r-", "reddit"),
     ("bing-", "bing"),

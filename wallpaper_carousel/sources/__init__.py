@@ -5,15 +5,24 @@ from __future__ import annotations
 from ..config import Settings
 from .base import Candidate, Source
 from .bing import BingSource
+from .nasa import NasaSource
+from .openverse import OpenverseSource
 from .picsum import PicsumSource
 from .reddit import RedditSource
 from .wallhaven import WallhavenSource
+from .wallpaperscom import WallpaperscomSource
+from .wikimedia import WikimediaSource
 
+# Ordem = prioridade de download (fontes premium primeiro).
 ALL_SOURCES: dict[str, Source] = {
     "wallhaven": WallhavenSource(),
-    "reddit": RedditSource(),
-    "bing": BingSource(),
+    "wikimedia": WikimediaSource(),
+    "nasa": NasaSource(),
+    "wallpaperscom": WallpaperscomSource(),
     "picsum": PicsumSource(),
+    "bing": BingSource(),
+    "openverse": OpenverseSource(),
+    "reddit": RedditSource(),  # legado: API anônima morta; RSS pode voltar
 }
 
 __all__ = [
@@ -26,7 +35,7 @@ __all__ = [
 
 
 def get_source(name: str) -> Source | None:
-    """Retorna a fonte pelo nome ("wallhaven"|"reddit"|"bing"|"picsum")."""
+    """Retorna a fonte pelo nome."""
     return ALL_SOURCES.get(name)
 
 

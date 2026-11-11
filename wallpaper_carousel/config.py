@@ -26,11 +26,19 @@ DEFAULT_THEMES = [
     "desert dunes",
     "aurora polar",
     "cherry blossom japan",
+    "northern lights aurora borealis",
+    "mountain lake reflection",
+    "waterfall forest moss",
+    "starry night milky way",
     "-",
 ]
 
 DEFAULT_SOURCE_WEIGHTS = {
     "wallhaven": 1.0,
+    "wikimedia": 0.9,
+    "nasa": 0.9,
+    "wallpaperscom": 0.7,
+    "openverse": 0.7,
     "reddit": 1.0,
     "bing": 0.55,
     "picsum": 0.75,
@@ -153,13 +161,23 @@ class Settings:
     api_sleep: float = 2.0
     themes: tuple[str, ...] = tuple(DEFAULT_THEMES)
     # Fontes
-    reddit_enabled: bool = True
+    reddit_enabled: bool = False  # API anônima morta; RSS morre em breve — reativar se voltar
     reddit_limit: int = 8
     bing_enabled: bool = True
     bing_days: int = 8
     bing_limit: int = 5
     picsum_enabled: bool = True
     picsum_limit: int = 10
+    # Novas fontes premium (v7.1)
+    wikimedia_enabled: bool = True
+    wikimedia_limit: int = 6
+    nasa_enabled: bool = False  # API APOD migrada/quebrada em 2026; reativar se voltar
+    nasa_limit: int = 3
+    wallpaperscom_enabled: bool = True
+    wallpaperscom_limit: int = 5
+    openverse_enabled: bool = False  # anônimo é 5 req/h; ativar com token
+    openverse_limit: int = 5
+    openverse_token: str = ""        # client_id:client_secret (opcional)
     # Cache de tela
     prep_resolution: tuple[int, int] | str = "auto"
     # Log
@@ -256,13 +274,26 @@ class Settings:
                 themes=tuple(
                     t for t in _env("WALLPAPER_THEMES", "|").split("|") if t
                 ) or tuple(DEFAULT_THEMES),
-                reddit_enabled=_bool("WALLPAPER_REDDIT_ENABLED", True),
+                reddit_enabled=_bool("WALLPAPER_REDDIT_ENABLED", False),
                 reddit_limit=_int("WALLPAPER_REDDIT_LIMIT", 8, 0, 500),
                 bing_enabled=_bool("WALLPAPER_BING_ENABLED", True),
                 bing_days=_int("WALLPAPER_BING_DAYS", 8, 1, 31),
                 bing_limit=_int("WALLPAPER_BING_LIMIT", 5, 0, 500),
                 picsum_enabled=_bool("WALLPAPER_PICSUM_ENABLED", True),
                 picsum_limit=_int("WALLPAPER_PICSUM_LIMIT", 10, 0, 500),
+                wikimedia_enabled=_bool("WALLPAPER_WIKIMEDIA_ENABLED", True),
+                wikimedia_limit=_int("WALLPAPER_WIKIMEDIA_LIMIT", 6, 0, 500),
+                nasa_enabled=_bool("WALLPAPER_NASA_ENABLED", False),
+                nasa_limit=_int("WALLPAPER_NASA_LIMIT", 3, 0, 500),
+                wallpaperscom_enabled=_bool(
+                    "WALLPAPER_WALLPAPERSCOM_ENABLED", True
+                ),
+                wallpaperscom_limit=_int(
+                    "WALLPAPER_WALLPAPERSCOM_LIMIT", 5, 0, 500
+                ),
+                openverse_enabled=_bool("WALLPAPER_OPENVERSE_ENABLED", False),
+                openverse_limit=_int("WALLPAPER_OPENVERSE_LIMIT", 5, 0, 500),
+                openverse_token=_env("WALLPAPER_OPENVERSE_TOKEN", ""),
                 prep_resolution=_resolution(
                     "WALLPAPER_PREP_RESOLUTION", "auto", allow_auto=True
                 ),

@@ -64,6 +64,14 @@ def _count_images(settings: Settings) -> int:
 def _source_label(name: str) -> str:
     if name.startswith("wallhaven-"):
         return "Wallhaven"
+    if name.startswith("wallpaperscom-"):
+        return "Wallpapers.com"
+    if name.startswith("wikimedia-"):
+        return "Wikimedia"
+    if name.startswith("nasa-"):
+        return "NASA"
+    if name.startswith("openverse-"):
+        return "Openverse"
     if name.startswith(("reddit-", "r-")):
         return "Reddit"
     if name.startswith("bing-"):
@@ -100,9 +108,9 @@ def _screen_cache_stats(settings: Settings) -> tuple[int, int, int]:
     return total, valid, outdated
 
 
-def _recent_errors(hours: int = 24) -> int:
+def _recent_errors(hours: int = 24, log_file: Path | None = None) -> int:
     try:
-        lines = read_lines(log_path_global())[-5000:]
+        lines = read_lines(log_file or log_path_global())[-5000:]
     except Exception:
         return 0
     cutoff = datetime.now().timestamp() - hours * 3600
@@ -191,7 +199,9 @@ def cmd_rotate(settings: Settings, state: State, dry_run: bool = False) -> int:
 
 
 def cmd_download(settings: Settings, state: State, source: str = "all") -> int:
-    valid = {"all", "wallhaven", "reddit", "bing", "picsum"}
+    from .sources import ALL_SOURCES
+
+    valid = {"all", *ALL_SOURCES}
     if source not in valid:
         log.error("Fonte inválida: '%s' (use: %s)", source, "|".join(sorted(valid)))
         return 2
@@ -286,7 +296,7 @@ def cmd_status(settings: Settings, state: State) -> int:
         print(f"Disco livre        : {st.free / (1024**3):.1f} GB")
     except OSError:
         pass
-    errs = _recent_errors(24)
+    errs = _recent_errors(24, settings.log_file)
     if errs:
         print(f"Avisos             : {errs} erro(s) nas últimas 24h")
     return 0
@@ -574,8 +584,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--dry-run", action="store_true")
 
     sp = add("download", "Baixa novos wallpapers")
-    sp.add_argument("source", nargs="?", default="all",
-                    choices=["all", "wallhaven", "reddit", "bing", "picsum"])
+    sp.add_argument(
+        "source", nargs="?", default="all",
+        choices=[
+            "all", "wallhaven", "wikimedia", "nasa", "wallpaperscom",
+            "picsum", "bing", "openverse", "reddit",
+        ],
+    )
 
     sp = add("prep", "Gera/valida caches -screen")
     sp.add_argument("--rebuild", action="store_true")

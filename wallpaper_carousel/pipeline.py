@@ -7,6 +7,7 @@ dedup perceptual (dHash), registro em state/ e cache de tela -screen.
 from __future__ import annotations
 
 import logging
+import re
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -32,6 +33,9 @@ from .state import State, is_master_name
 log = logging.getLogger("wallpaper.pipeline")
 
 USER_AGENT = "wallpaper-carousel/7.0 (Fedora KDE; rewrite Python)"
+
+# Nomes de arquivo vindos de APIs externas: só ASCII seguro, sem path.
+_SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def http_session() -> requests.Session:
@@ -194,55 +198,68 @@ def download_from_source(
     session = http_session()
 
     try:
-        candidates = list(src.candidates(settings, state))
-    except Exception as exc:
-        log.error("Fonte %s falhou ao listar candidatos: %s", source_name, exc)
-        result.errors.append(str(exc))
-        return result
-
-    candidates.sort(key=lambda c: c.hint, reverse=True)
-    log.info(
-        "%s: %d candidato(s). Baixando até %d novos...",
-        source_name,
-        len(candidates),
-        max_new,
-    )
-
-    for cand in candidates:
-        if result.accepted >= max_new:
-            break
-        if cand.ident in known_ids:
-            result.skipped += 1
-            continue
-        dest = settings.images_dir / cand.name
-        if not is_master_name(cand.name) or dest.exists():
-            result.skipped += 1
-            continue
-        suffix = f".{cand.ext}"
-        with tempfile.NamedTemporaryFile(
-            suffix=suffix, dir=settings.logs_dir, delete=False
-        ) as tf:
-            tmp = Path(tf.name)
         try:
-            if not _download_one(session, cand.url, tmp):
-                result.rejected += 1
-                continue
-            if accept_image(tmp, dest, cand.ident, source_name, settings, state):
-                result.accepted += 1
-                known_ids.add(cand.ident)
-            else:
-                result.rejected += 1
-        finally:
-            tmp.unlink(missing_ok=True)
-        time.sleep(1)
+            candidates = list(src.candidates(settings, state))
+        except Exception as exc:
+            log.error("Fonte %s falhou ao listar candidatos: %s", source_name, exc)
+            result.errors.append(str(exc))
+            return result
 
-    log.info(
-        "%s: %d nova(s), %d rejeitada(s), %d pulada(s).",
-        source_name,
-        result.accepted,
-        result.rejected,
-        result.skipped,
-    )
+        candidates.sort(key=lambda c: c.hint, reverse=True)
+        log.info(
+            "%s: %d candidato(s). Baixando até %d novos...",
+            source_name,
+            len(candidates),
+            max_new,
+        )
+
+        for cand in candidates:
+            if result.accepted >= max_new:
+                break
+            if cand.ident in known_ids:
+                result.skipped += 1
+                continue
+            # Segurança: name vem de APIs externas — rejeita path
+            # traversal, separadores e nomes que não são master válido.
+            if (
+                not _SAFE_NAME_RE.match(cand.name)
+                or "/" in cand.name
+                or "\\" in cand.name
+                or not is_master_name(cand.name)
+            ):
+                result.skipped += 1
+                continue
+            dest = settings.images_dir / cand.name
+            if dest.exists():
+                result.skipped += 1
+                continue
+            suffix = f".{cand.ext}"
+            with tempfile.NamedTemporaryFile(
+                suffix=suffix, dir=settings.logs_dir, delete=False
+            ) as tf:
+                tmp = Path(tf.name)
+            try:
+                if not _download_one(session, cand.url, tmp):
+                    result.rejected += 1
+                    continue
+                if accept_image(tmp, dest, cand.ident, source_name, settings, state):
+                    result.accepted += 1
+                    known_ids.add(cand.ident)
+                else:
+                    result.rejected += 1
+            finally:
+                tmp.unlink(missing_ok=True)
+            time.sleep(1)
+
+        log.info(
+            "%s: %d nova(s), %d rejeitada(s), %d pulada(s).",
+            source_name,
+            result.accepted,
+            result.rejected,
+            result.skipped,
+        )
+    finally:
+        session.close()
     return result
 
 
@@ -252,20 +269,25 @@ def _default_limit(source_name: str, settings: Settings) -> int:
         "reddit": settings.reddit_limit,
         "bing": settings.bing_limit,
         "picsum": settings.picsum_limit,
+        "wikimedia": settings.wikimedia_limit,
+        "nasa": settings.nasa_limit,
+        "wallpaperscom": settings.wallpaperscom_limit,
+        "openverse": settings.openverse_limit,
     }.get(source_name, settings.download_limit)
 
 
 def download(
-    sources: list[str] | str,
+    sources: str,
     settings: Settings,
     state: State,
 ) -> list[DownloadResult]:
-    """Executa download para uma fonte ou 'all'."""
-    names = (
-        ["wallhaven", "reddit", "bing", "picsum"]
-        if sources == "all"
-        else [sources]
-    )
+    """Executa download para uma fonte ou 'all' (todas as habilitadas)."""
+    if sources == "all":
+        from .sources import all_enabled
+
+        names = [src.name for src in all_enabled(settings)]
+    else:
+        names = [sources]
     results = []
     for name in names:
         results.append(download_from_source(name, settings, state))
@@ -308,11 +330,14 @@ def remove_master(name: str, settings: Settings, state: State) -> None:
 
 
 def _drop_state_line(path: Path, name: str) -> None:
-    lines = [
-        ln
-        for ln in path.read_text(encoding="utf-8").splitlines()
-        if ln.split("\t")[0].strip() != name
-    ]
+    try:
+        lines = [
+            ln
+            for ln in path.read_text(encoding="utf-8").splitlines()
+            if ln.split("\t")[0].strip() != name
+        ]
+    except OSError:
+        return
     from .state import atomic_write_text
 
     atomic_write_text(path, "\n".join(lines) + ("\n" if lines else ""))
@@ -351,8 +376,6 @@ def prune(settings: Settings, state: State) -> int:
     feedback = load_feedback(state)
 
     try:
-        from .scoring import prune_candidates
-
         rows = prune_candidates(settings, count=over * 4, state=state)
         candidates = [r["name"] for r in rows]
     except Exception:

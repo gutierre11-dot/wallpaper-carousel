@@ -117,6 +117,9 @@ class RedditSource:
         except ValueError:
             log.warning("JSON inválido da API do Reddit.")
             return []
+        if not isinstance(payload, dict):
+            log.warning("Resposta inesperada da API do Reddit.")
+            return []
         rows: list[tuple[str, int, str]] = []
         for child in (payload.get("data") or {}).get("children") or []:
             data = child.get("data") or {}

@@ -61,6 +61,9 @@ class BingSource:
             except ValueError:
                 log.warning("JSON inválido do Bing Image Archive.")
                 return
+            if not isinstance(payload, dict):
+                log.warning("Resposta inesperada do Bing Image Archive.")
+                return
         finally:
             session.close()
 

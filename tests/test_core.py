@@ -269,6 +269,36 @@ def test_accept_image_dedup(tmp_path, settings, state):
     assert not dest2.exists()
 
 
+def test_download_rejects_unsafe_name(tmp_path, settings, state, monkeypatch):
+    """Candidato com name malicioso (path traversal) é pulado sem download."""
+    from wallpaper_carousel import pipeline
+    from wallpaper_carousel.sources import ALL_SOURCES
+    from wallpaper_carousel.sources.base import Candidate
+
+    class EvilSource:
+        name = "evil"
+
+        def enabled(self, s):
+            return True
+
+        def candidates(self, s, st):
+            yield Candidate(
+                source="evil", ident="e1", name="../evil.jpg",
+                url="http://127.0.0.1:1/x.jpg", ext="jpg",
+            )
+            yield Candidate(
+                source="evil", ident="e2", name="ok name!.jpg",
+                url="http://127.0.0.1:1/x.jpg", ext="jpg",
+            )
+
+    monkeypatch.setitem(ALL_SOURCES, "evil", EvilSource())
+    result = pipeline.download_from_source("evil", settings, state)
+    assert result.accepted == 0
+    assert result.skipped == 2
+    assert not (tmp_path / "evil.jpg").exists()
+    assert not (settings.images_dir.parent / "evil.jpg").exists()
+
+
 # ---------------------------------------------------------------------------
 # scoring
 # ---------------------------------------------------------------------------
@@ -355,11 +385,18 @@ def test_scoring_prune_candidates(settings, state):
 def test_sources_registry(settings):
     from wallpaper_carousel.sources import ALL_SOURCES, all_enabled, get_source
 
-    assert set(ALL_SOURCES) == {"wallhaven", "reddit", "bing", "picsum"}
+    assert set(ALL_SOURCES) == {
+        "wallhaven", "wikimedia", "nasa", "wallpaperscom",
+        "picsum", "bing", "openverse", "reddit",
+    }
     assert get_source("wallhaven") is not None
     assert get_source("nope") is None
     enabled = {s.name for s in all_enabled(settings)}
-    assert enabled == {"wallhaven", "reddit", "bing", "picsum"}
+    # reddit/nasa/openverse off por padrão (APIs mortas ou rate limit)
+    assert enabled == {
+        "wallhaven", "wikimedia", "wallpaperscom",
+        "picsum", "bing",
+    }
 
 
 def test_candidate_fields():

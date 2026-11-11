@@ -26,13 +26,15 @@ API_URL = "https://wallhaven.cc/api/v1/search"
 USER_AGENT = "wallpaper-carousel/7.0-python (wallpaper carousel; +https://wallhaven.cc)"
 TIMEOUT = 30
 
-# (sorting, topRange|None, broad) — idêntico a wh_strategy() do bash.
-_STRATEGIES: tuple[tuple[str, str | None, bool], ...] = (
-    ("toplist", "1w", False),
-    ("toplist", "1M", False),
-    ("toplist", "6M", False),
-    ("date_added", None, False),
-    ("toplist", "1M", True),
+# (sorting, topRange|None, broad, atleast|None) — evolução do bash v6.
+# ``atleast`` None = usa settings.resolution; "4k" = exige >=3840x2160.
+_STRATEGIES: tuple[tuple[str, str | None, bool, str | None], ...] = (
+    ("toplist", "1w", False, None),
+    ("toplist", "1M", False, "4k"),      # 4K primeiro: premium
+    ("toplist", "6M", False, None),
+    ("date_added", None, False, "4k"),
+    ("toplist", "1M", True, None),
+    ("toplist", "1y", False, "4k"),      # os mais bem votados do ano em 4K
 )
 _N_STRATEGIES = len(_STRATEGIES)
 
@@ -57,22 +59,24 @@ class WallhavenSource:
         # Contadores são lidos e incrementados uma única vez por execução,
         # antes da busca — garante avanço mesmo se o consumidor abandonar
         # o iterador no meio (equivale ao bash, que sempre grava no fim).
-        strategy_idx = state.source_idx % _N_STRATEGIES
+        # source_idx é monotônico e compartilhado entre fontes: NÃO gravar
+        # o valor wrapped, apenas derivar os índices localmente.
+        raw_idx = state.source_idx
+        state.source_idx = raw_idx + 1
+        strategy_idx = raw_idx % _N_STRATEGIES
         themes = settings.themes
         theme_idx = state.theme_idx % len(themes) if themes else 0
         theme = themes[theme_idx] if themes else ""
-        state.source_idx = (strategy_idx + 1) % _N_STRATEGIES
-        if themes:
-            state.theme_idx = (theme_idx + 1) % len(themes)
+        state.theme_idx = state.theme_idx + 1
 
-        sorting, top_range, broad = _STRATEGIES[strategy_idx]
+        sorting, top_range, broad, atleast = _STRATEGIES[strategy_idx]
         q_label = "—" if (broad or theme in ("", "-")) else theme
         log.info(
             "Wallhaven: estratégia %d (%s, topRange=%s, broad=%s) tema='%s'",
             strategy_idx, sorting, top_range, broad, q_label,
         )
 
-        rows = self._fetch_all(settings, sorting, top_range, broad, theme)
+        rows = self._fetch_all(settings, sorting, top_range, broad, theme, atleast)
         if not rows:
             log.warning("Wallhaven sem resultados (estratégia %d, tema '%s').",
                         strategy_idx, q_label)
@@ -105,6 +109,7 @@ class WallhavenSource:
         top_range: str | None,
         broad: bool,
         theme: str,
+        atleast: str | None,
     ) -> list[tuple[int, str, str, str]]:
         """Coleta (favorites, id, path, ext) de todas as páginas/estratégias.
 
@@ -112,7 +117,9 @@ class WallhavenSource:
         tema, refaz a estratégia uma vez com broad=1 (sem 'q').
         """
         for attempt in range(2):
-            rows = self._fetch_pages(settings, sorting, top_range, broad, theme)
+            rows = self._fetch_pages(
+                settings, sorting, top_range, broad, theme, atleast
+            )
             if rows:
                 break
             if attempt == 0 and not broad and theme not in ("", "-"):
@@ -133,13 +140,19 @@ class WallhavenSource:
         top_range: str | None,
         broad: bool,
         theme: str,
+        atleast: str | None,
     ) -> list[tuple[int, str, str, str]]:
         """Busca as páginas 1..settings.pages; nunca levanta exceção."""
         w, h = settings.resolution
+        if atleast == "4k":
+            # >=4K, mas nunca abaixo da resolução mínima configurada.
+            min_res = f"{max(w, 3840)}x{max(h, 2160)}"
+        else:
+            min_res = f"{w}x{h}"
         params_base = {
             "sorting": sorting,
             "order": "desc",
-            "atleast": f"{w}x{h}",
+            "atleast": min_res,
             "ratios": ",".join(f"{rw}x{rh}" for rw, rh in settings.ratios),
             "categories": settings.categories,
             "purity": settings.purity,
@@ -177,6 +190,10 @@ class WallhavenSource:
                     payload = resp.json()
                 except ValueError:
                     log.warning("JSON inválido p.%d da API Wallhaven.", page)
+                    time.sleep(settings.api_sleep)
+                    continue
+                if not isinstance(payload, dict):
+                    log.warning("Resposta inesperada p.%d da API Wallhaven.", page)
                     time.sleep(settings.api_sleep)
                     continue
                 for item in payload.get("data") or []:
